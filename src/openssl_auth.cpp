@@ -59,22 +59,30 @@ const char* s3fs_crypt_lib_name(void)
 //-------------------------------------------------------------------
 bool s3fs_init_global_ssl(void)
 {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
   ERR_load_crypto_strings();
   ERR_load_BIO_strings();
   OpenSSL_add_all_algorithms();
+#endif
   return true;
 }
 
 bool s3fs_destroy_global_ssl(void)
 {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
   EVP_cleanup();
   ERR_free_strings();
+#endif
   return true;
 }
 
 //-------------------------------------------------------------------
 // Utility Function for crypt lock
 //-------------------------------------------------------------------
+// OpenSSL 1.1+ removes/no-ops the locking callback machinery and
+// internally manages thread safety, so all of the helpers below are
+// only needed for OpenSSL <= 1.0.2.
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 // internal use struct for openssl
 struct CRYPTO_dynlock_value
 {
@@ -131,9 +139,11 @@ static void s3fs_destroy_dyn_crypt_mutex(struct CRYPTO_dynlock_value* dyndata, c
     free(dyndata);
   }
 }
+#endif // OPENSSL_VERSION_NUMBER < 0x10100000L
 
 bool s3fs_init_crypt_mutex(void)
 {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
   if(s3fs_crypt_mutex){
     S3FS_PRN_DBG("s3fs_crypt_mutex is not NULL, destroy it.");
     if(!s3fs_destroy_crypt_mutex()){
@@ -155,12 +165,13 @@ bool s3fs_init_crypt_mutex(void)
   CRYPTO_set_dynlock_create_callback(s3fs_dyn_crypt_mutex);
   CRYPTO_set_dynlock_lock_callback(s3fs_dyn_crypt_mutex_lock);
   CRYPTO_set_dynlock_destroy_callback(s3fs_destroy_dyn_crypt_mutex);
-
+#endif
   return true;
 }
 
 bool s3fs_destroy_crypt_mutex(void)
 {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
   if(!s3fs_crypt_mutex){
     return true;
   }
@@ -177,7 +188,7 @@ bool s3fs_destroy_crypt_mutex(void)
   CRYPTO_cleanup_all_ex_data();
   free(s3fs_crypt_mutex);
   s3fs_crypt_mutex = NULL;
-
+#endif
   return true;
 }
 
@@ -222,9 +233,12 @@ size_t get_md5_digest_length(void)
 
 unsigned char* s3fs_md5hexsum(int fd, off_t start, ssize_t size)
 {
-  MD5_CTX md5ctx;
-  char    buf[512];
-  ssize_t bytes;
+  // Use EVP_* APIs so this works against OpenSSL 3.x where the
+  // low-level MD5_* symbols may be hidden by the no-deprecated build.
+  const EVP_MD*  md = EVP_md5();
+  EVP_MD_CTX*    md5ctx;
+  char           buf[512];
+  ssize_t        bytes;
   unsigned char* result;
 
   if(-1 == size){
@@ -240,9 +254,10 @@ unsigned char* s3fs_md5hexsum(int fd, off_t start, ssize_t size)
     return NULL;
   }
 
-  memset(buf, 0, 512);
-  MD5_Init(&md5ctx);
+  md5ctx = EVP_MD_CTX_create();
+  EVP_DigestInit_ex(md5ctx, md, NULL);
 
+  memset(buf, 0, 512);
   for(ssize_t total = 0; total < size; total += bytes){
     bytes = 512 < (size - total) ? 512 : (size - total);
     bytes = read(fd, buf, bytes);
@@ -252,16 +267,19 @@ unsigned char* s3fs_md5hexsum(int fd, off_t start, ssize_t size)
     }else if(-1 == bytes){
       // error
       S3FS_PRN_ERR("file read error(%d)", errno);
+      EVP_MD_CTX_destroy(md5ctx);
       return NULL;
     }
-    MD5_Update(&md5ctx, buf, bytes);
+    EVP_DigestUpdate(md5ctx, buf, bytes);
     memset(buf, 0, 512);
   }
 
   if(NULL == (result = (unsigned char*)malloc(get_md5_digest_length()))){
+    EVP_MD_CTX_destroy(md5ctx);
     return NULL;
   }
-  MD5_Final(result, &md5ctx);
+  EVP_DigestFinal_ex(md5ctx, result, NULL);
+  EVP_MD_CTX_destroy(md5ctx);
 
   if(-1 == lseek(fd, start, SEEK_SET)){
     free(result);
@@ -273,8 +291,10 @@ unsigned char* s3fs_md5hexsum(int fd, off_t start, ssize_t size)
 
 unsigned char* s3fs_md5_fd(int fd, off_t start, off_t size)
 {
-    MD5_CTX md5ctx;
-    off_t   bytes;
+    // Use EVP_* APIs (see note in s3fs_md5hexsum above).
+    const EVP_MD*  md = EVP_md5();
+    EVP_MD_CTX*    md5ctx;
+    off_t          bytes;
     unsigned char* result;
 
     if(-1 == size){
@@ -285,7 +305,8 @@ unsigned char* s3fs_md5_fd(int fd, off_t start, off_t size)
         size = st.st_size;
     }
 
-    MD5_Init(&md5ctx);
+    md5ctx = EVP_MD_CTX_create();
+    EVP_DigestInit_ex(md5ctx, md, NULL);
 
     for(off_t total = 0; total < size; total += bytes){
         const off_t len = 512;
@@ -298,13 +319,15 @@ unsigned char* s3fs_md5_fd(int fd, off_t start, off_t size)
         }else if(-1 == bytes){
             // error
             S3FS_PRN_ERR("file read error(%d)", errno);
+            EVP_MD_CTX_destroy(md5ctx);
             return NULL;
         }
-        MD5_Update(&md5ctx, buf, bytes);
+        EVP_DigestUpdate(md5ctx, buf, bytes);
     }
 
     result = new unsigned char[get_md5_digest_length()];
-    MD5_Final(result, &md5ctx);
+    EVP_DigestFinal_ex(md5ctx, result, NULL);
+    EVP_MD_CTX_destroy(md5ctx);
 
     return result;
 }
