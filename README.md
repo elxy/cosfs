@@ -6,6 +6,23 @@
 cosfs 能让您在Linux/Mac OS X 系统中把Tencent COS bucket 挂载到本地文件
 系统中，您能够便捷的通过本地文件系统操作COS 上的对象，实现数据的共享。
 
+### 内部 COS 适配说明（本 fork）
+
+本 fork **仅适配内部 COS**（host 形如 `*.tencent-cloud.com`），与公网腾讯云
+COS（`cos.<region>.myqcloud.com`）在签名细节上不兼容，请勿混用。
+
+相对上游 cosfs 的关键改动：
+
+- `src/openssl_auth.cpp`：兼容 OpenSSL 3.x（移除 `ERR_load_BIO_strings` 等
+  已删 API；CRYPTO 锁回调与 SSL init/destroy 在 1.1+ 改为 no-op；MD5 切换到
+  EVP 接口以兼容 `no-deprecated` 构建）。
+- `src/string_util.cpp`：`urlEncodeForSign` 改用**小写 hex**
+  （`%2f` 而非 `%2F`），与 cos_helper 通过 `urlencode + quote_via=quote +
+  sp_lower` 算出的 FormatString 完全一致；这是通过内部 COS 网关验签的必要条件。
+- `src/curl.cpp`：HEAD 响应解析时把自定义 `Size` 头映射到 `Content-Length`。
+  内部 COS 的 HEAD 响应始终是 `Content-Length: 0`，真实对象大小放在自定义 `Size`
+  头里，不做这层映射 `ls -la` 看到的所有文件大小都会是 0、`cat` 也会读出空内容。
+
 ### 功能
 
 cosfs 基于s3fs 构建，具有s3fs 的全部功能。主要功能包括：
@@ -58,9 +75,43 @@ sudo yum install automake gcc-c++ git libcurl-devel libxml2-devel \
 
 macOS:
 
+本 fork 在 macOS（含 Apple Silicon / arm64）下推荐用 **FUSE-T**
+（用户态实现，无需内核扩展、无需重启）。也兼容传统的 macFUSE，但需要授权
+内核扩展，本节只演示 FUSE-T。
+
+依赖：
+
 ```shell
-brew install automake git curl libxml2 make pkg-config openssl 
-brew cask install osxfuse
+brew install automake pkg-config libxml2 openssl@3 curl
+brew install --cask fuse-t      # 用户态 FUSE，无 kext
+```
+
+FUSE-T 的 pkg-config 模块名是 `fuse-t`，而 cosfs 的 `configure.ac` 写死了
+找 `fuse`，需要写一个 shim 把 fuse-t 伪装成 `fuse 2.9.9`：
+
+```bash
+mkdir -p /tmp/fuse-shim/pkgconfig
+cat > /tmp/fuse-shim/pkgconfig/fuse.pc <<'EOF'
+prefix=/usr/local
+libdir=${prefix}/lib
+includedir=${prefix}/include/fuse
+
+Name: fuse
+Description: shim that maps libfuse name to fuse-t
+Version: 2.9.9
+Libs: -L${libdir} -Wl,-rpath,${libdir} -lfuse-t
+Cflags: -I${includedir} -D_FILE_OFFSET_BITS=64 -DFUSE_USE_VERSION=29
+EOF
+```
+
+编译时把 fuse shim 与 brew 的 openssl@3/libxml2/curl 一起放进
+`PKG_CONFIG_PATH`，同时用 `LDFLAGS` 把 openssl@3 的 `-L` 排到前面（避免
+`/usr/local/lib` 下 Intel Homebrew 残留的 x86_64 `libcrypto.dylib` 干扰
+arm64 链接）：
+
+```bash
+export PKG_CONFIG_PATH="/tmp/fuse-shim/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix libxml2)/lib/pkgconfig:$(brew --prefix curl)/lib/pkgconfig"
+export LDFLAGS="-L$(brew --prefix openssl@3)/lib"
 ```
  
 如果在编译过程中遇到提示fuse版本低于2.8.4，请参考常见问题来解决
@@ -71,10 +122,13 @@ brew cask install osxfuse
 git clone https://github.com/XXX/cosfs.git
 cd cosfs
 ./autogen.sh
-./configure
+./configure --with-openssl
 make
 sudo make install
 ```
+
+macOS 编译完成后可用 `otool -L src/cosfs` 验证：依赖应该是
+`@rpath/libfuse-t.dylib` 和 `/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib`。
 
 ### 运行
 
@@ -108,19 +162,27 @@ bucketname_prefix:<SecretId>:<SecretKey>
 #### 示例
 
 将`my-bucket`这个bucket挂载到`/tmp/cosfs`目录下，AccessKeyId是`faint`，
-AccessKeySecret是`123`，cos endpoint是`http://cos.ap-guangzhou.myqcloud.com`
+AccessKeySecret是`123`，内部 COS endpoint 是 `https://sh.gfp.tencent-cloud.com`
 ```
 echo my-bucket:faint:123 > /etc/passwd-cosfs
 chmod 640 /etc/passwd-cosfs
 mkdir /tmp/cosfs
-cosfs my-bucket /tmp/cosfs -ourl=http://cos.ap-guangzhou.myqcloud.com -odbglevel=info -ouse_cache=/path/to/local_cache
+cosfs my-bucket /tmp/cosfs -ourl=https://sh.gfp.tencent-cloud.com -odbglevel=info -ouse_cache=/path/to/local_cache
 ```
 -ouse_cache 指定了使用本地cache来缓存临时文件，进一步提高性能，如果不需要本地cache或者本地磁盘容量有限，可不指定该选项
 
 卸载bucket:
 
+Linux：
+
 ```bash
 fusermount -u /tmp/cosfs # non-root user
+```
+
+macOS（FUSE-T 走的是用户态 NFS loopback，用普通 `umount` 即可）：
+
+```bash
+umount /tmp/cosfs
 ```
 
 
