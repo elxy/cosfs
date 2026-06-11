@@ -176,11 +176,17 @@ string urlEncode2(const string &s)
   return result;
 }
 
-/** 
- * urlEncode for cos signature,
- * perform regular urlEncode. 
- */ 
+/*
+ * urlEncode for cos signature.
+ *
+ * NOTE: matches cos_helper's behavior (Python urlencode + quote_via=quote,
+ * which uses safe='' internally) -- every byte outside the unreserved set
+ * gets percent-encoded with LOWERCASE hex digits.  In particular '/' must
+ * be encoded to '%2f' (cos_helper does this via sp_lower).  Upstream
+ * cosfs encoded with UPPERCASE hex which the internal COS gateway rejects.
+ */
 string urlEncodeForSign(const string &s) {
+  static const char hexLower[] = "0123456789abcdef";
   string result;
   for (unsigned i = 0; i < s.length(); ++i) {
     char c = s[i];
@@ -194,8 +200,8 @@ string urlEncodeForSign(const string &s) {
       result += c;
     } else {
       result += "%";
-      result += hexAlphabet[static_cast<unsigned char>(c) / 16];
-      result += hexAlphabet[static_cast<unsigned char>(c) % 16];
+      result += hexLower[static_cast<unsigned char>(c) / 16];
+      result += hexLower[static_cast<unsigned char>(c) % 16];
     }
   } 
   return result;
