@@ -2423,6 +2423,14 @@ int S3fsCurl::HeadRequest(const char* tpath, headers_t& meta)
       meta["Content-Type"] = value;
     }else if(key == "content-length"){
       meta["Content-Length"] = value;
+    }else if(key == "size"){
+      // Internal COS: HEAD response always has Content-Length: 0 and puts
+      // the real object size in a custom `Size` header.  Map it onto
+      // Content-Length so downstream code (get_size() in s3fs_util.cpp)
+      // sees the correct file size.  std::map iteration is in key order
+      // and "content-length" < "size", so this overrides whatever value
+      // the standard header set above.
+      meta["Content-Length"] = value;
     }else if(key == "etag"){
       meta["ETag"] = value;
     }else if(key == "last-modified"){
